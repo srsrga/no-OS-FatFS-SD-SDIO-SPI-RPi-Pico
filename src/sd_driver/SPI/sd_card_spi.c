@@ -593,7 +593,14 @@ static block_dev_err_t sd_cmd(sd_card_t *sd_card_p, const cmdSupported cmd, uint
         return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
     }
     if (response & R1_COM_CRC_ERROR && ACMD23_SET_WR_BLK_ERASE_COUNT != cmd) {
-        DBG_PRINTF("CRC error CMD:%d response 0x%" PRIx32 "\n", cmd, response);
+        // EMSG, not DBG: a CRC failure is an error, and DBG_PRINTF shares a
+        // channel with sd_spi_go_high_frequency's per-command "Actual
+        // frequency" line -- 28316 of the 28318 lines in a twelve-hour
+        // capture. Anyone who quiets that channel to stop the flood would
+        // otherwise lose this, and this is the one library message the soak
+        // watches: it once showed 221 errors on a run whose every per-cycle
+        // number looked perfect.
+        EMSG_PRINTF("CRC error CMD:%d response 0x%" PRIx32 "\n", cmd, response);
         return SD_BLOCK_DEVICE_ERROR_CRC;  // CRC error
     }
     if (response & R1_ILLEGAL_COMMAND) {
@@ -792,7 +799,7 @@ static block_dev_err_t read_bytes(sd_card_t *sd_card_p, uint8_t *buffer, uint32_
     crc |= sd_spi_read(sd_card_p);
 
     if (!chk_crc16(buffer, length, crc)) {
-        DBG_PRINTF("%s: Invalid CRC received: 0x%" PRIx16 "\n", __func__, crc);
+        EMSG_PRINTF("%s: Invalid CRC received: 0x%" PRIx16 "\n", __func__, crc);
         return SD_BLOCK_DEVICE_ERROR_CRC;
     }
     return 0;
@@ -867,8 +874,8 @@ static block_dev_err_t in_sd_read_blocks(sd_card_t *sd_card_p, uint8_t *buffer,
         if (prev_buffer_addr) {
             // Check previous block's CRC:
             if (!chk_crc16(prev_buffer_addr, sd_block_size, prev_block_crc)) {
-                DBG_PRINTF("%s: Invalid CRC received: 0x%" PRIx16 "\n", __func__,
-                           prev_block_crc);
+                EMSG_PRINTF("%s: Invalid CRC received: 0x%" PRIx16 "\n", __func__,
+                            prev_block_crc);
                 return SD_BLOCK_DEVICE_ERROR_CRC;
             }
         }
@@ -892,7 +899,7 @@ static block_dev_err_t in_sd_read_blocks(sd_card_t *sd_card_p, uint8_t *buffer,
     }
     // Check final block's CRC:
     if (!chk_crc16(prev_buffer_addr, sd_block_size, prev_block_crc)) {
-        DBG_PRINTF("%s: Invalid CRC received: 0x%" PRIx16 "\n", __func__, prev_block_crc);
+        EMSG_PRINTF("%s: Invalid CRC received: 0x%" PRIx16 "\n", __func__, prev_block_crc);
         return SD_BLOCK_DEVICE_ERROR_CRC;
     }
     return status;
