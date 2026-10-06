@@ -194,6 +194,12 @@
 #  define TRACE 0
 #endif
 
+// Test hooks, set from another core ($CRCCMD, $CRCDATA): the next n data
+// commands (CMD17/18/24/25), or the next n written data blocks, go out with
+// a wrong CRC, so the card rejects them the way a bus glitch would make it.
+volatile uint32_t sd_test_bad_cmd_crc = 0;
+volatile uint32_t sd_test_bad_data_crc = 0;
+
 #ifndef SD_CRC_ENABLED
 #define SD_CRC_ENABLED 1
 #endif
@@ -303,6 +309,12 @@ static uint8_t sd_cmd_spi(sd_card_t *sd_card_p, cmdSupported cmd, uint32_t arg) 
 
     if (crc_on) {
         cmd_packet[5] = (crc7(cmd_packet, 5) << 1) | 0x01;
+        if (sd_test_bad_cmd_crc &&
+            ((CMD17_READ_SINGLE_BLOCK == cmd) || (CMD18_READ_MULTIPLE_BLOCK == cmd) ||
+             (CMD24_WRITE_BLOCK == cmd) || (CMD25_WRITE_MULTIPLE_BLOCK == cmd))) {
+            sd_test_bad_cmd_crc--;
+            cmd_packet[5] ^= 0x02;   // a CRC bit; the end bit stays 1
+        }
     } else {
         // CMD0 is executed in SD mode, hence should have correct CRC
         // CMD8 CRC verification is always enabled
@@ -579,6 +591,20 @@ static block_dev_err_t sd_cmd(sd_card_t *sd_card_p, const cmdSupported cmd, uint
         if (R1_NO_RESPONSE == response) {
             DBG_PRINTF("No response CMD:%d\n", cmd);
             // Re-try command
+            continue;
+        }
+        // A command the card rejected for its CRC was not executed -- the
+        // R1 bit says the CRC of the command just received failed -- so it
+        // is safe to send again, the same as one that got no answer. A bus
+        // glitch on CMD25 used to fail the whole write at the first try.
+        // Said once per retry, so a card that fails every attempt is still
+        // visible in the log (the soak counts these lines).
+        if ((response & R1_COM_CRC_ERROR) && (ACMD23_SET_WR_BLK_ERASE_COUNT != cmd) &&
+            (i + 1 < sd_timeouts.sd_command_retries)) {
+            EMSG_PRINTF("CRC error CMD:%d response 0x%" PRIx32 ", retrying\n", cmd, response);
+            if (false == sd_wait_ready(sd_card_p, sd_timeouts.sd_command)) {
+                DBG_PRINTF("Card not ready yet\n");
+            }
             continue;
         }
         break;
@@ -1005,6 +1031,7 @@ static block_dev_err_t send_block(sd_card_t *sd_card_p, const uint8_t *buffer, u
     if (crc_on) {
         // Compute CRC
         crc = crc16((void *)buffer, length);
+        if (sd_test_bad_data_crc) { sd_test_bad_data_crc--; crc ^= 0x0001; }
     }
     uint32_t timeout = calculate_transfer_time_ms(sd_card_p->spi_if_p->spi, length);
     bool ok = sd_spi_transfer_wait_complete(sd_card_p, timeout);
@@ -1208,8 +1235,11 @@ static block_dev_err_t write_block(sd_card_t *sd_card_p, const uint8_t *buffer,
     status = sd_cmd(sd_card_p, CMD24_WRITE_BLOCK, address, false, 0);
     if (SD_BLOCK_DEVICE_ERROR_NONE != status) return status;
 
-    // Write data
-    send_block(sd_card_p, buffer, SPI_START_BLOCK, sd_block_size);
+    // Write data. Its result counts: the data response token is the only
+    // place the card says it rejected the block (CRC '101', write error
+    // '110'), and CMD13 below says nothing about that. Ignoring it reported a
+    // rejected sector -- a FAT or directory sector, typically -- as written.
+    block_dev_err_t sent = send_block(sd_card_p, buffer, SPI_START_BLOCK, sd_block_size);
 
     /*
     Once the programming operation is completed, the
@@ -1226,7 +1256,7 @@ static block_dev_err_t write_block(sd_card_t *sd_card_p, const uint8_t *buffer,
     uint32_t stat = 0;
     status = sd_cmd(sd_card_p, CMD13_SEND_STATUS, 0, false, &stat);
 
-    return status;
+    return (SD_BLOCK_DEVICE_ERROR_NONE != sent) ? sent : status;
 }
 /**
  * @brief Programs blocks to a block device
@@ -1273,9 +1303,14 @@ static block_dev_err_t sd_write_blocks(sd_card_t *sd_card_p, uint8_t const buffe
 
     block_dev_err_t status;
 
-    // If writing only one block, use the optimized function
+    // If writing only one block, use the optimized function -- retried on a
+    // rejected block like the multiple-block path below.
     if (1 == num_wrt_blks) {
-        status = write_block(sd_card_p, buffer, data_address);
+        unsigned retries = sd_timeouts.sd_command_retries;
+        do {
+            if (retries < sd_timeouts.sd_command_retries) DBG_PRINTF("Retrying\n");
+            status = write_block(sd_card_p, buffer, data_address);
+        } while (SD_BLOCK_DEVICE_ERROR_WRITE == status && --retries);
     } else {
         // If writing multiple blocks, retry the operation until it succeeds or reaches the maximum number of retries
         unsigned retries = sd_timeouts.sd_command_retries;
