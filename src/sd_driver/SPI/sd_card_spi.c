@@ -392,9 +392,31 @@ another SD card could use the SPI during any gaps
 in the first SD card's utilization.
 However, these gaps are generally small.
 */
+// The bus may be shared: on the MPA200 the oven's ADC drives this SPI too,
+// and loads its own, slower clock for every reading. The rate was set here
+// once, at initialisation, so every card transfer after an ADC reading ran at
+// the ADC's rate -- 8 kB reads took 21 ms instead of 4 -- unless something
+// outside the driver happened to set it back first. So take the bus at this
+// card's rate every time: drain whatever another device left in the receive
+// FIFO, and load the divisor with the peripheral disabled (the PL022 must not
+// have its prescaler written while enabled, or SCK glitches and the card
+// loses a bit). Not while the card is being initialised: that runs at
+// 400 kHz on purpose.
+static void sd_take_bus(sd_card_t *sd_card_p) {
+    if (sd_card_p->state.m_Status & STA_NOINIT) return;
+    spi_inst_t *spi = sd_card_p->spi_if_p->spi->hw_inst;
+    while (spi_is_readable(spi)) (void)spi_get_hw(spi)->dr;
+    spi_get_hw(spi)->icr = SPI_SSPICR_RORIC_BITS;
+    hw_clear_bits(&spi_get_hw(spi)->cr1, SPI_SSPCR1_SSE_BITS);
+    spi_set_baudrate(spi, sd_card_p->spi_if_p->spi->baud_rate);
+    hw_set_bits(&spi_get_hw(spi)->cr1, SPI_SSPCR1_SSE_BITS);
+}
+
 static void sd_acquire(sd_card_t *sd_card_p) {
     sd_lock(sd_card_p);
-    sd_spi_acquire(sd_card_p);
+    sd_spi_lock(sd_card_p);
+    sd_take_bus(sd_card_p);
+    sd_spi_select(sd_card_p);
 }
 static void sd_release(sd_card_t *sd_card_p) {
     sd_spi_release(sd_card_p);
